@@ -490,6 +490,10 @@ class NotionAIProxy:
 
             def stream_worker():
                 try:
+                    # 使用增量解码器正确处理跨 chunk 的多字节 UTF-8 字符
+                    import codecs
+
+                    utf8_decoder = codecs.getincrementaldecoder("utf-8")("replace")
                     with CurlSession(impersonate="chrome") as s:
                         resp = s.post(
                             self.API_URL,
@@ -503,7 +507,13 @@ class NotionAIProxy:
                             return
                         for chunk in resp.iter_content(chunk_size=None):
                             if chunk:
-                                q.put(("data", chunk.decode("utf-8", errors="replace")))
+                                text = utf8_decoder.decode(chunk, False)
+                                if text:
+                                    q.put(("data", text))
+                        # 刷新解码器缓冲区中剩余的字节
+                        remaining = utf8_decoder.decode(b"", True)
+                        if remaining:
+                            q.put(("data", remaining))
                     q.put(("done", None))
                 except Exception as e:
                     q.put(("error", str(e)))
