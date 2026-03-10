@@ -30,6 +30,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from common import parse_patches, extract_tokens, create_app, register_routes
+
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
 )
@@ -388,14 +390,27 @@ class NotionAIProxy:
         self.auth = NotionAuth()
         self._lock = asyncio.Lock()
 
+    async def health_check(self) -> bool:
+        return await self.auth.health_check()
+
     def _now_iso(self) -> str:
         return time.strftime("%Y-%m-%dT%H:%M:%S.000+08:00")
 
-    def _build_body(self, message: str, model: str = None) -> dict:
+    def _build_body(self, message: str, model: str = None, system: str = None) -> dict:
         """基于原生模板构建请求体，只替换动态字段"""
         import copy
 
         body = copy.deepcopy(self.auth.body_template)
+
+        # 如果提供了 system prompt，嵌入到 user message 前面
+        if system:
+            full_message = (
+                f"<system>\n{system}\n</system>\n\n"
+                f"请严格遵循上述 system 指令回答以下问题，"
+                f"直接输出最终回答，不要输出思考过程。\n\n{message}"
+            )
+        else:
+            full_message = message
 
         # 替换动态字段
         body["traceId"] = str(uuid.uuid4())
@@ -403,7 +418,7 @@ class NotionAIProxy:
         for step in body["transcript"]:
             step["id"] = str(uuid.uuid4())
             if step["type"] == "user":
-                step["value"] = [[message]]
+                step["value"] = [[full_message]]
                 step["createdAt"] = self._now_iso()
             if step["type"] == "context":
                 step["value"]["currentDatetime"] = self._now_iso()
@@ -427,58 +442,17 @@ class NotionAIProxy:
 
     def _parse_patches(self, ndjson_text: str) -> str:
         """从 NDJSON patch 流提取 AI 回复文本"""
-        tokens = []
-        first_token = ""
-        for line in ndjson_text.split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if obj.get("type") != "patch":
-                continue
-            for v in obj.get("v", []):
-                op, path, val = v.get("o"), v.get("p", ""), v.get("v")
-                if op == "a" and path == "/s/-":
-                    if isinstance(val, dict) and val.get("type") == "agent-inference":
-                        for item in val.get("value", []):
-                            if item.get("type") == "text":
-                                first_token = item.get("content", "")
-                if op == "x" and path.endswith("/content"):
-                    tokens.append(val or "")
-        return first_token + "".join(tokens)
+        return parse_patches(ndjson_text)
 
     def _extract_tokens(self, ndjson_text: str) -> list[str]:
         """提取 token 列表"""
-        tokens = []
-        for line in ndjson_text.split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if obj.get("type") != "patch":
-                continue
-            for v in obj.get("v", []):
-                op, path, val = v.get("o"), v.get("p", ""), v.get("v")
-                if op == "a" and path == "/s/-":
-                    if isinstance(val, dict) and val.get("type") == "agent-inference":
-                        for item in val.get("value", []):
-                            if item.get("type") == "text":
-                                tokens.append(item.get("content", ""))
-                if op == "x" and path.endswith("/content"):
-                    tokens.append(val or "")
-        return tokens
+        return extract_tokens(ndjson_text)
 
-    async def chat(self, message: str, model: str = None) -> dict:
+    async def chat(self, message: str, model: str = None, system: str = None) -> dict:
         """同步接口"""
         async with self._lock:
             await self.auth.refresh()
-            body = self._build_body(message, model)
+            body = self._build_body(message, model, system)
             headers = self._build_headers()
 
             loop = asyncio.get_event_loop()
@@ -503,11 +477,11 @@ class NotionAIProxy:
                 raise HTTPException(resp.status_code, f"Notion 返回 {resp.status_code}")
             return resp.text
 
-    async def chat_stream(self, message: str, model: str = None):
+    async def chat_stream(self, message: str, model: str = None, system: str = None):
         """SSE 流式接口"""
         async with self._lock:
             await self.auth.refresh()
-            body = self._build_body(message, model)
+            body = self._build_body(message, model, system)
             headers = self._build_headers()
 
             loop = asyncio.get_event_loop()
@@ -566,49 +540,9 @@ class NotionAIProxy:
 #  FastAPI
 # ============================================================
 
-app = FastAPI(title="Notion AI Proxy (HTTP)", version="1.0.0")
-app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
-)
-
+app = create_app("Notion AI Proxy (HTTP)", "2.0.0")
 proxy = NotionAIProxy()
-
-
-class ChatRequest(BaseModel):
-    message: str
-    model: str = None
-
-
-@app.get("/health")
-async def health():
-    ok = await proxy.auth.health_check()
-    return {"status": "ok" if ok else "error", "mode": "http"}
-
-
-@app.post("/chat")
-async def chat(req: ChatRequest):
-    """同步返回完整 AI 回复"""
-    try:
-        return await proxy.chat(req.message, req.model)
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"错误: {e}", exc_info=True)
-        raise HTTPException(500, str(e))
-
-
-@app.post("/chat/stream")
-async def chat_stream(req: ChatRequest):
-    """SSE 流式返回 AI 回复"""
-    return StreamingResponse(
-        proxy.chat_stream(req.message, req.model),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
+register_routes(app, proxy)
 
 
 if __name__ == "__main__":

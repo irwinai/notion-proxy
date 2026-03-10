@@ -26,10 +26,9 @@ import uuid
 import time
 
 import aiohttp
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from fastapi import HTTPException
+
+from common import parse_patches, extract_tokens, create_app, register_routes
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
@@ -63,54 +62,11 @@ class NotionAIProxy:
 
     def _parse_patches(self, ndjson_text: str) -> str:
         """从 NDJSON patch 流提取 AI 回复文本"""
-        tokens = []
-        first_token = ""
-        for line in ndjson_text.split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if obj.get("type") != "patch":
-                continue
-            for v in obj.get("v", []):
-                op, path, val = v.get("o"), v.get("p", ""), v.get("v")
-                if op == "a" and path == "/s/-":
-                    if isinstance(val, dict) and val.get("type") == "agent-inference":
-                        for item in val.get("value", []):
-                            if item.get("type") == "text":
-                                first_token = item.get("content", "")
-                if op == "x" and path.endswith("/content"):
-                    tokens.append(val or "")
-        return first_token + "".join(tokens)
+        return parse_patches(ndjson_text)
 
     def _extract_tokens_from_ndjson(self, ndjson_text: str) -> list[str]:
         """从 NDJSON patch 流提取 token 列表（用于流式返回）"""
-        tokens = []
-        for line in ndjson_text.split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if obj.get("type") != "patch":
-                continue
-            for v in obj.get("v", []):
-                op, path, val = v.get("o"), v.get("p", ""), v.get("v")
-                # 首个 token
-                if op == "a" and path == "/s/-":
-                    if isinstance(val, dict) and val.get("type") == "agent-inference":
-                        for item in val.get("value", []):
-                            if item.get("type") == "text":
-                                tokens.append(item.get("content", ""))
-                # 增量 token
-                if op == "x" and path.endswith("/content"):
-                    tokens.append(val or "")
-        return tokens
+        return extract_tokens(ndjson_text)
 
     async def _create_session(self):
         """创建 CDP 会话，返回 (ws, eval_js, request_id)"""
@@ -259,8 +215,15 @@ class NotionAIProxy:
         except Exception:
             pass
 
-    async def chat(self, message: str) -> dict:
+    async def chat(self, message: str, model: str = None, system: str = None) -> dict:
         """同步接口：等待完整回复后返回"""
+        # DOM 方案: system prompt 嵌入到 message 前面
+        if system:
+            message = (
+                f"<system>\n{system}\n</system>\n\n"
+                f"请严格遵循上述 system 指令回答以下问题，"
+                f"直接输出最终回答，不要输出思考过程。\n\n{message}"
+            )
         async with self._lock:
             session, ws, eval_js = await self._create_session()
             try:
@@ -309,15 +272,17 @@ class NotionAIProxy:
             finally:
                 await self._cleanup(eval_js, request_id, session, ws)
 
-    async def chat_stream(self, message: str):
+    async def chat_stream(self, message: str, model: str = None, system: str = None):
         """
         流式接口：逐 token 生成 SSE 事件。
-
-        SSE 格式:
-        data: {"token": "你"}
-        data: {"token": "好"}
-        data: [DONE]
         """
+        # DOM 方案: system prompt 嵌入到 message 前面
+        if system:
+            message = (
+                f"<system>\n{system}\n</system>\n\n"
+                f"请严格遵循上述 system 指令回答以下问题，"
+                f"直接输出最终回答，不要输出思考过程。\n\n{message}"
+            )
         async with self._lock:
             session, ws, eval_js = await self._create_session()
             try:
@@ -378,48 +343,9 @@ class NotionAIProxy:
 #  FastAPI
 # ============================================================
 
-app = FastAPI(title="Notion AI Proxy", version="4.1.0")
-app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
-)
-
+app = create_app("Notion AI Proxy (DOM)", "4.2.0")
 proxy = NotionAIProxy()
-
-
-class ChatRequest(BaseModel):
-    message: str
-
-
-@app.get("/health")
-async def health():
-    ok = await proxy.health_check()
-    return {"status": "ok" if ok else "error"}
-
-
-@app.post("/chat")
-async def chat(req: ChatRequest):
-    """同步返回完整 AI 回复"""
-    try:
-        return await proxy.chat(req.message)
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"错误: {e}", exc_info=True)
-        raise HTTPException(500, str(e))
-
-
-@app.post("/chat/stream")
-async def chat_stream(req: ChatRequest):
-    """SSE 流式返回 AI 回复（逐 token）"""
-    return StreamingResponse(
-        proxy.chat_stream(req.message),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
+register_routes(app, proxy)
 
 
 if __name__ == "__main__":
@@ -429,6 +355,6 @@ if __name__ == "__main__":
         ok = await proxy.health_check()
         logger.info("✅ CDP 正常" if ok else "❌ CDP 失败")
 
-    logger.info("Notion AI 反向代理 v4.1 | http://0.0.0.0:8100")
+    logger.info("Notion AI 反向代理 v4.2 (DOM) | http://0.0.0.0:8100")
     asyncio.get_event_loop().run_until_complete(check())
     uvicorn.run(app, host="0.0.0.0", port=8100)

@@ -59,6 +59,21 @@ curl -X POST http://localhost:8100/chat \
   -d '{"message": "你好"}'
 ```
 
+**请求参数:**
+
+| 参数 | 类型 | 必须 | 说明 |
+|------|------|------|------|
+| `message` | string | ✅ | 用户消息 |
+| `system` | string | ❌ | System prompt（角色设定/指令） |
+| `model` | string | ❌ | 模型代号（默认使用 Notion 当前选择的模型） |
+
+**带 system prompt 示例:**
+```bash
+curl -X POST http://localhost:8100/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"message": "BTC明天涨不涨？", "system": "你是一个专业的加密货币分析师，回答要简洁有力。"}'
+```
+
 **响应:**
 ```json
 {"reply": "你好！有什么我可以帮你的吗？"}
