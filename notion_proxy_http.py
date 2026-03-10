@@ -30,7 +30,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from common import parse_patches, extract_tokens, create_app, register_routes
+from common import (
+    ChatRequest,
+    StreamingTokenParser,
+    create_app,
+    parse_patches,
+    register_routes,
+)
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
@@ -443,10 +449,6 @@ class NotionAIProxy:
         """从 NDJSON patch 流提取 AI 回复文本"""
         return parse_patches(ndjson_text)
 
-    def _extract_tokens(self, ndjson_text: str) -> list[str]:
-        """提取 token 列表"""
-        return extract_tokens(ndjson_text)
-
     async def chat(self, message: str, model: str = None, system: str = None) -> dict:
         """同步接口"""
         async with self._lock:
@@ -509,6 +511,8 @@ class NotionAIProxy:
             t = threading.Thread(target=stream_worker, daemon=True)
             t.start()
 
+            parser = StreamingTokenParser()
+
             while True:
                 try:
                     msg_type, data = await loop.run_in_executor(
@@ -520,7 +524,7 @@ class NotionAIProxy:
                     continue
 
                 if msg_type == "data":
-                    tokens = self._extract_tokens(data)
+                    tokens = parser.feed(data)
                     for token in tokens:
                         yield f"data: {json.dumps({'token': token}, ensure_ascii=False)}\n\n"
 

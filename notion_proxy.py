@@ -28,7 +28,7 @@ import time
 import aiohttp
 from fastapi import HTTPException
 
-from common import parse_patches, extract_tokens, create_app, register_routes
+from common import StreamingTokenParser, parse_patches, create_app, register_routes
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
@@ -63,10 +63,6 @@ class NotionAIProxy:
     def _parse_patches(self, ndjson_text: str) -> str:
         """从 NDJSON patch 流提取 AI 回复文本"""
         return parse_patches(ndjson_text)
-
-    def _extract_tokens_from_ndjson(self, ndjson_text: str) -> list[str]:
-        """从 NDJSON patch 流提取 token 列表（用于流式返回）"""
-        return extract_tokens(ndjson_text)
 
     async def _create_session(self):
         """创建 CDP 会话，返回 (ws, eval_js, request_id)"""
@@ -279,8 +275,7 @@ class NotionAIProxy:
         if system:
             message = (
                 f"<system>\n{system}\n</system>\n\n"
-                f"请严格遵循上述 system 指令回答以下问题，"
-                f"直接输出最终回答，不要输出思考过程。\n\n{message}"
+                f"请严格遵循上述 system 指令回答以下问题。\n\n{message}"
             )
         async with self._lock:
             session, ws, eval_js = await self._create_session()
@@ -288,7 +283,7 @@ class NotionAIProxy:
                 request_id = await self._inject_hook_and_trigger(eval_js, message)
                 logger.info("流式等待 AI 响应...")
                 start = time.time()
-                last_parsed_pos = 0  # 上次解析到的 data 位置
+                parser = StreamingTokenParser()
 
                 for i in range(120):  # 最多等 120 * 0.5s = 60s
                     await asyncio.sleep(0.5)
@@ -317,7 +312,7 @@ class NotionAIProxy:
                     # 解析新增数据中的 tokens
                     new_data = state.get("newData", "")
                     if new_data:
-                        tokens = self._extract_tokens_from_ndjson(new_data)
+                        tokens = parser.feed(new_data)
                         for token in tokens:
                             yield f"data: {json.dumps({'token': token}, ensure_ascii=False)}\n\n"
 

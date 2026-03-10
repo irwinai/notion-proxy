@@ -27,15 +27,20 @@ class ChatRequest(BaseModel):
 def _iter_patches(ndjson_text: str):
     """遍历 NDJSON patch 流，过滤 thinking 内容，只 yield 正式回复的 token。
 
-    Notion AI 的响应结构：
-    - ADD agent-inference + value[0].type='thinking' → 思考内容（过滤）
-    - ADD agent-inference + value[0].type='tool_use'  → 工具调用（过滤）
-    - ADD agent-inference + value[0].type='text'      → 正式回复（保留）
-    - 增量 token 的 path: /s/{index}/value/0/content
+    Notion AI 的响应有两种格式：
+    格式 A（简单消息）:
+      - ADD /s/- agent-inference, value[0].type='text' → 正式回复
+      - 增量 token: /s/{index}/value/0/content
+
+    格式 B（工具调用/深度思考模式）:
+      - ADD /s/- agent-inference, value[0].type='thinking' → 思考内容
+      - ADD /s/{idx}/value/- type='text' → 正式回复（后续追加）
+      - 增量 token: /s/{index}/value/{sub_idx}/content
     """
-    # 追踪哪些 /s/{index} 是正式回复（text 类型）
+    # 追踪哪些 /s/{idx} 包含 text 类型子节点（用实际的 /s/ 索引）
     text_indices = set()
-    node_count = 0  # 当前 /s/ 下的节点数
+    # 从 patch-start 获取初始节点数，用于计算追加节点的实际索引
+    node_count = 0
 
     for line in ndjson_text.split("\n"):
         line = line.strip()
@@ -45,37 +50,50 @@ def _iter_patches(ndjson_text: str):
             obj = json.loads(line)
         except json.JSONDecodeError:
             continue
+
+        # 从 patch-start 获取初始节点数
+        if obj.get("type") == "patch-start":
+            node_count = len(obj.get("data", {}).get("s", []))
+            continue
+
         if obj.get("type") != "patch":
             continue
         for v in obj.get("v", []):
             op, path, val = v.get("o"), v.get("p", ""), v.get("v")
 
-            # 新增 agent-inference 节点
+            # 顶级 /s/- 追加节点（格式 A）
             if op == "a" and path == "/s/-":
                 if isinstance(val, dict) and val.get("type") == "agent-inference":
-                    node_count += 1
                     items = val.get("value", [])
                     if items and isinstance(items[0], dict):
-                        item_type = items[0].get("type", "")
-                        if item_type == "text":
-                            # 这是正式回复节点
+                        if items[0].get("type") == "text":
                             text_indices.add(node_count)
                             content = items[0].get("content", "")
                             if content:
                                 yield content
-                else:
-                    node_count += 1
+                node_count += 1
 
-            # 增量 token: /s/{index}/value/0/content
+            # 子节点追加: /s/{idx}/value/- 追加 text 节点（格式 B）
+            if op == "a" and isinstance(val, dict) and val.get("type") == "text":
+                parts = path.split("/")
+                if len(parts) >= 4 and parts[3] == "value":
+                    try:
+                        idx = int(parts[2])
+                        text_indices.add(idx)
+                        content = val.get("content", "")
+                        if content:
+                            yield content
+                    except (IndexError, ValueError):
+                        pass
+
+            # 增量 token: /s/{index}/value/{sub}/content
             if op == "x" and path.endswith("/content"):
-                # 提取 path 中的索引: /s/3/value/0/content → 3
                 parts = path.split("/")
                 try:
                     idx = int(parts[2])
                     if idx in text_indices:
                         yield val or ""
                 except (IndexError, ValueError):
-                    # 无法解析索引，保底输出
                     if text_indices:
                         yield val or ""
 
@@ -85,9 +103,80 @@ def parse_patches(ndjson_text: str) -> str:
     return "".join(_iter_patches(ndjson_text))
 
 
-def extract_tokens(ndjson_text: str) -> list[str]:
-    """从 NDJSON patch 流提取 token 列表（过滤 thinking）"""
-    return list(_iter_patches(ndjson_text))
+class StreamingTokenParser:
+    """有状态的流式 token 解析器。
+
+    解决流式场景下每个 chunk 独立调用导致状态丢失的问题。
+    支持两种 Notion AI 响应格式（格式 A 和格式 B）。
+    """
+
+    def __init__(self):
+        self.text_indices = set()
+        self.node_count = 0
+        self._buffer = ""  # 处理跨 chunk 的不完整行
+
+    def feed(self, ndjson_text: str) -> list[str]:
+        """输入新的 NDJSON 数据块，返回解析出的 token 列表。"""
+        tokens = []
+        data = self._buffer + ndjson_text
+        lines = data.split("\n")
+        self._buffer = lines[-1]
+        for line in lines[:-1]:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            # 从 patch-start 获取初始节点数
+            if obj.get("type") == "patch-start":
+                self.node_count = len(obj.get("data", {}).get("s", []))
+                continue
+
+            if obj.get("type") != "patch":
+                continue
+            for v in obj.get("v", []):
+                op, path, val = v.get("o"), v.get("p", ""), v.get("v")
+
+                # 顶级 /s/- 追加节点（格式 A）
+                if op == "a" and path == "/s/-":
+                    if isinstance(val, dict) and val.get("type") == "agent-inference":
+                        items = val.get("value", [])
+                        if items and isinstance(items[0], dict):
+                            if items[0].get("type") == "text":
+                                self.text_indices.add(self.node_count)
+                                content = items[0].get("content", "")
+                                if content:
+                                    tokens.append(content)
+                    self.node_count += 1
+
+                # 子节点追加: /s/{idx}/value/- 追加 text 节点（格式 B）
+                if op == "a" and isinstance(val, dict) and val.get("type") == "text":
+                    parts = path.split("/")
+                    if len(parts) >= 4 and parts[3] == "value":
+                        try:
+                            idx = int(parts[2])
+                            self.text_indices.add(idx)
+                            content = val.get("content", "")
+                            if content:
+                                tokens.append(content)
+                        except (IndexError, ValueError):
+                            pass
+
+                # 增量 token: /s/{index}/value/{sub}/content
+                if op == "x" and path.endswith("/content"):
+                    parts = path.split("/")
+                    try:
+                        idx = int(parts[2])
+                        if idx in self.text_indices:
+                            tokens.append(val or "")
+                    except (IndexError, ValueError):
+                        if self.text_indices:
+                            tokens.append(val or "")
+
+        return tokens
 
 
 def create_app(title: str, version: str) -> FastAPI:
