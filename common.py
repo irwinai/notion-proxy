@@ -24,10 +24,19 @@ class ChatRequest(BaseModel):
     system: str = None
 
 
-def parse_patches(ndjson_text: str) -> str:
-    """从 NDJSON patch 流提取完整 AI 回复文本"""
-    tokens = []
-    first_token = ""
+def _iter_patches(ndjson_text: str):
+    """遍历 NDJSON patch 流，过滤 thinking 内容，只 yield 正式回复的 token。
+
+    Notion AI 的响应结构：
+    - ADD agent-inference + value[0].type='thinking' → 思考内容（过滤）
+    - ADD agent-inference + value[0].type='tool_use'  → 工具调用（过滤）
+    - ADD agent-inference + value[0].type='text'      → 正式回复（保留）
+    - 增量 token 的 path: /s/{index}/value/0/content
+    """
+    # 追踪哪些 /s/{index} 是正式回复（text 类型）
+    text_indices = set()
+    node_count = 0  # 当前 /s/ 下的节点数
+
     for line in ndjson_text.split("\n"):
         line = line.strip()
         if not line:
@@ -40,41 +49,45 @@ def parse_patches(ndjson_text: str) -> str:
             continue
         for v in obj.get("v", []):
             op, path, val = v.get("o"), v.get("p", ""), v.get("v")
+
+            # 新增 agent-inference 节点
             if op == "a" and path == "/s/-":
                 if isinstance(val, dict) and val.get("type") == "agent-inference":
-                    for item in val.get("value", []):
-                        if item.get("type") == "text":
-                            first_token = item.get("content", "")
+                    node_count += 1
+                    items = val.get("value", [])
+                    if items and isinstance(items[0], dict):
+                        item_type = items[0].get("type", "")
+                        if item_type == "text":
+                            # 这是正式回复节点
+                            text_indices.add(node_count)
+                            content = items[0].get("content", "")
+                            if content:
+                                yield content
+                else:
+                    node_count += 1
+
+            # 增量 token: /s/{index}/value/0/content
             if op == "x" and path.endswith("/content"):
-                tokens.append(val or "")
-    return first_token + "".join(tokens)
+                # 提取 path 中的索引: /s/3/value/0/content → 3
+                parts = path.split("/")
+                try:
+                    idx = int(parts[2])
+                    if idx in text_indices:
+                        yield val or ""
+                except (IndexError, ValueError):
+                    # 无法解析索引，保底输出
+                    if text_indices:
+                        yield val or ""
+
+
+def parse_patches(ndjson_text: str) -> str:
+    """从 NDJSON patch 流提取完整 AI 回复文本（过滤 thinking）"""
+    return "".join(_iter_patches(ndjson_text))
 
 
 def extract_tokens(ndjson_text: str) -> list[str]:
-    """从 NDJSON patch 流提取 token 列表（用于流式返回）"""
-    tokens = []
-    for line in ndjson_text.split("\n"):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if obj.get("type") != "patch":
-            continue
-        for v in obj.get("v", []):
-            op, path, val = v.get("o"), v.get("p", ""), v.get("v")
-            # 首个 token
-            if op == "a" and path == "/s/-":
-                if isinstance(val, dict) and val.get("type") == "agent-inference":
-                    for item in val.get("value", []):
-                        if item.get("type") == "text":
-                            tokens.append(item.get("content", ""))
-            # 增量 token
-            if op == "x" and path.endswith("/content"):
-                tokens.append(val or "")
-    return tokens
+    """从 NDJSON patch 流提取 token 列表（过滤 thinking）"""
+    return list(_iter_patches(ndjson_text))
 
 
 def create_app(title: str, version: str) -> FastAPI:
