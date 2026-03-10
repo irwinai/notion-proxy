@@ -221,8 +221,7 @@ class NotionAIProxy:
         if system:
             message = (
                 f"<system>\n{system}\n</system>\n\n"
-                f"请严格遵循上述 system 指令回答以下问题，"
-                f"直接输出最终回答，不要输出思考过程。\n\n{message}"
+                f"请严格遵循上述 system 指令回答以下问题。\n\n{message}"
             )
         async with self._lock:
             session, ws, eval_js = await self._create_session()
