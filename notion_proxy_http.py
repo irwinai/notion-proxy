@@ -317,7 +317,7 @@ class NotionAuth:
                                 )
 
                 # 注入 body 捕获 hook
-                await evaluate(
+                hook_result = await evaluate(
                     """
                 (function() {
                     if (!window._origFetchForCapture) window._origFetchForCapture = window.fetch;
@@ -334,43 +334,49 @@ class NotionAuth:
                 """,
                     timeout=5000,
                 )
+                logger.info(f"Hook 注入结果: {hook_result}")
 
                 # 触发 AI 消息（通过 DOM 操控）
                 trigger_result = await evaluate(
                     """
                 (async () => {
                     const btn = document.querySelector('[data-testid="sidebar-ai-button"]');
+                    const btnInfo = btn ? 'found' : 'not found';
                     if (btn) btn.click();
-                    await new Promise(r => setTimeout(r, 1000));
+                    await new Promise(r => setTimeout(r, 1500));
                     const editors = document.querySelectorAll('[contenteditable="true"]');
-                    if (!editors.length) return 'no editors';
+                    if (!editors.length) return 'no editors, btn=' + btnInfo;
                     const input = editors[editors.length - 1];
                     input.focus();
                     document.execCommand('selectAll', false, null);
                     document.execCommand('delete', false, null);
                     document.execCommand('insertText', false, 'hi');
-                    await new Promise(r => setTimeout(r, 300));
+                    await new Promise(r => setTimeout(r, 500));
                     input.dispatchEvent(new KeyboardEvent('keydown', {
                         key: 'Enter', code: 'Enter', keyCode: 13,
                         bubbles: true, cancelable: true
                     }));
-                    return 'sent';
+                    return 'sent, editors=' + editors.length + ', btn=' + btnInfo;
                 })()
                 """,
-                    timeout=10000,
+                    timeout=15000,
                 )
+                logger.info(f"触发结果: {trigger_result}")
 
-                if trigger_result != "sent":
+                if not trigger_result or "sent" not in str(trigger_result):
                     logger.warning(f"模板捕获触发失败: {trigger_result}")
                     return
 
                 # 等待捕获
-                for _ in range(10):
+                for i in range(15):
                     await asyncio.sleep(1)
                     body_str = await evaluate("window._capturedBody || ''")
-                    if body_str and len(body_str) > 100:
+                    body_len = len(body_str) if body_str else 0
+                    if i % 3 == 0:
+                        logger.info(f"等待模板... 第{i+1}秒, 捕获长度={body_len}")
+                    if body_str and body_len > 100:
                         self._body_template = json.loads(body_str)
-                        logger.info(f"✅ Body 模板捕获成功 ({len(body_str)} chars)")
+                        logger.info(f"✅ Body 模板捕获成功 ({body_len} chars)")
                         break
 
                 # 恢复 fetch
@@ -405,6 +411,11 @@ class NotionAIProxy:
     def _build_body(self, message: str, model: str = None, system: str = None) -> dict:
         """基于原生模板构建请求体，只替换动态字段"""
         import copy
+
+        if not self.auth.body_template:
+            raise RuntimeError(
+                "Body 模板未捕获，请确保 Notion 已打开 AI 聊天页面后重启服务"
+            )
 
         body = copy.deepcopy(self.auth.body_template)
 
